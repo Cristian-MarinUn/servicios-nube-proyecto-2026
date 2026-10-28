@@ -101,6 +101,10 @@ class Resultados:
     def __init__(self):
         self.filas = []  # dicts: seccion, nombre, maximo, puntos (None = no evaluado), detalle
         self.descuentos = {}  # clave -> (motivo, valor): se restan de la nota (escala 0-5), una vez por clave
+        self.revisar = {}  # clave -> texto: lo que el script no puede decidir solo y debe mirar el profesor
+
+    def por_revisar(self, clave, texto_):
+        self.revisar.setdefault(clave, texto_)
 
     def descontar(self, clave, motivo):
         """Descuento de seguridad sobre la nota (escala 0-5). Cada clave descuenta una sola vez."""
@@ -423,6 +427,13 @@ def reglas_abiertas(sg):
     return salida
 
 
+def origenes_regla(permiso):
+    """Orígenes de una regla de entrada: bloques CIDR y security groups."""
+    return ([x.get("CidrIp") for x in permiso.get("IpRanges", [])]
+            + [x.get("CidrIpv6") for x in permiso.get("Ipv6Ranges", [])]
+            + [f"grupo {x.get('GroupId')}" for x in permiso.get("UserIdGroupPairs", [])])
+
+
 def cubre(regla, puerto):
     proto, desde, hasta = regla
     return proto in ("-1", "tcp") and desde <= puerto <= hasta
@@ -534,15 +545,12 @@ def sec_seguridad(cfg, res, ctx):
 
     # --- SSH ---
     est22, banner22 = sondear(host_app, 22)
-    res.agregar(s, "El servidor de la app no atiende SSH en el puerto 22 desde internet", 0, est22 != "abierto",
+    res.agregar(s, "El puerto 22 de la app no responde desde este computador", 0, est22 != "abierto",
                 f"puerto 22: {est22.replace('_', ' ')}" + (f" ({banner22})" if banner22 else ""), informativo=True)
-    if est22 == "abierto":
-        res.descontar("ssh", "SSH abierto en el puerto 22 desde internet")
     if ssh is None:
         print(color("  (SSH en otro puerto omitido: falta ssh_puerto en el config.json)", "90"))
     elif ssh == 22:
-        res.agregar(s, "SSH en un puerto distinto al 22", 0, 0, "ssh_puerto es 22", informativo=True)
-        res.descontar("ssh", "SSH en el puerto 22 (ssh_puerto = 22)")
+        print(color("  (ssh_puerto es 22: lo que importa es a quién se lo abre el security group; use --aws para verlo)", "90"))
     else:
         est, banner = sondear(host_app, ssh)
         if est == "abierto" and banner.startswith("SSH-"):
@@ -563,6 +571,10 @@ def sec_seguridad(cfg, res, ctx):
 
     # --- Security groups (necesitan --aws) ---
     if not grupos:
+        if est22 == "abierto":
+            res.por_revisar("ssh22", "El puerto 22 responde desde este computador: puede estar abierto a todo internet "
+                            "o restringido a un origen que incluye esta red. Pida la captura del security group "
+                            "(regla de entrada del puerto 22) o ejecute con --aws con las credenciales del grupo")
         return
 
     def revisar(rol, etiqueta, permitidos):
@@ -588,8 +600,19 @@ def sec_seguridad(cfg, res, ctx):
                     "; ".join(fuera) or "", informativo=True)
     en_22 = [f"{sg['GroupName']}: {regla_txt(r)}" for rol in ("app", "servidores") for sg in grupos.get(rol, [])
              for r in reglas_abiertas(sg) if cubre(r, 22)]
+    restringidos = sorted({o for rol in ("app", "servidores") for sg in grupos.get(rol, [])
+                           for p in sg.get("IpPermissions", [])
+                           if cubre((p.get("IpProtocol"), p.get("FromPort", 0), p.get("ToPort", 65535)), 22)
+                           and not any(o in MUNDO for o in origenes_regla(p))
+                           for o in origenes_regla(p)})
+    if en_22:
+        detalle_22 = "; ".join(sorted(set(en_22)))
+    elif restringidos:
+        detalle_22 = "puerto 22 restringido a su origen: " + ", ".join(restringidos)
+    else:
+        detalle_22 = "no hay regla de entrada para el puerto 22"
     res.agregar(s, "Ningún security group deja el puerto 22 abierto a todo internet", 0, not en_22,
-                "; ".join(sorted(set(en_22))) or "", informativo=True)
+                detalle_22, informativo=True)
     if en_22:
         res.descontar("ssh", "un security group deja el puerto 22 abierto a todo internet")
 
@@ -739,6 +762,11 @@ def main():
         print(color(f"Descuentos de seguridad sobre la nota (escala 0-5): -{sum(v for _, v in res.descuentos.values()):g}", "1"))
         for motivo, valor in res.descuentos.values():
             print(f"  {color('✘', '31')} -{valor:g}  {motivo}")
+    if res.revisar:
+        print()
+        print(color("Para revisar a mano (el script no puede decidirlo solo):", "1"))
+        for texto_ in res.revisar.values():
+            print(f"  {color('?', '33')} {texto_}")
     print("El monitoreo (10 puntos) lo califica el profesor con el correo de alerta que usted le reenvía.")
     print("El informe de arquitectura y la estimación de costos (15 puntos) también los califica el profesor.")
 
@@ -748,6 +776,7 @@ def main():
                    "puntaje": total, "maximo_evaluado": maximo_eval, "maximo_total": maximo_total,
                    "descuentos": [{"motivo": m, "valor": v} for m, v in res.descuentos.values()],
                    "descuento_total": round(sum(v for _, v in res.descuentos.values()), 2),
+                   "revisar_a_mano": list(res.revisar.values()),
                    "verificaciones": res.filas}, f, ensure_ascii=False, indent=2)
     print(f"Detalle guardado en {args.salida}")
 
