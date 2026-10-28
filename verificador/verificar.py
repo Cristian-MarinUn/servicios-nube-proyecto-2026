@@ -161,9 +161,7 @@ def bucket_sin_acceso_anonimo(bucket, region, claves=()):
 def error_generico(cabeceras, cuerpo):
     """Por qué la respuesta sin ID de instancia parece una página de error por defecto y no una hecha
     por el grupo. Devuelve el motivo, o '' si parece una página propia."""
-    servidor = next((v for k, v in cabeceras.items() if k.lower() == "server"), "")
-    if "awselb" in servidor.lower():  # respuesta fabricada por el propio balanceador
-        return "la respuesta la fabrica el balanceador (cabecera Server: awselb)"
+    # No se usa la cabecera Server: el balanceador la pone también en las páginas propias del grupo.
     if len(cuerpo) < 50:
         return f"la respuesta está vacía o casi ({len(cuerpo)} bytes)"
     if len(cuerpo) < 2000 and ERROR_POR_DEFECTO.search(texto(cuerpo)):
