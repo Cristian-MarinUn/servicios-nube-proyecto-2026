@@ -63,6 +63,9 @@ ERROR_POR_DEFECTO = re.compile(
 
 USE_COLOR = sys.stdout.isatty()
 
+# Descuento sobre la nota (escala 0-5) por cada problema de seguridad: SSH, puerto del RDS y bucket abierto
+DESCUENTO = 0.2
+
 
 def color(texto, codigo):
     return f"\033[{codigo}m{texto}\033[0m" if USE_COLOR else texto
@@ -97,6 +100,11 @@ def unir(base, ruta):
 class Resultados:
     def __init__(self):
         self.filas = []  # dicts: seccion, nombre, maximo, puntos (None = no evaluado), detalle
+        self.descuentos = {}  # clave -> (motivo, valor): se restan de la nota (escala 0-5), una vez por clave
+
+    def descontar(self, clave, motivo):
+        """Descuento de seguridad sobre la nota (escala 0-5). Cada clave descuenta una sola vez."""
+        self.descuentos.setdefault(clave, (motivo, DESCUENTO))
 
     def agregar(self, seccion, nombre, maximo, fraccion, detalle="", informativo=False):
         """fraccion en [0,1] o None si no se evaluó. Las filas informativas no suman puntos."""
@@ -237,17 +245,20 @@ def sec_galeria(cfg, res, ctx):
 
     estado_b, detalle = bucket_estado(cfg["bucket_imagenes"])
     privado = estado_b == "privado"
+    abierto = estado_b == "publico"
     if privado and muestra:
         # el objeto sin firma tampoco debe abrirse
         sin_firma = muestra[0].split("?")[0]
         e, _, _ = http("GET", sin_firma)
         if e == 200:
-            privado, detalle = False, "los objetos se abren sin URL firmada"
+            privado, abierto, detalle = False, True, "los objetos se abren sin URL firmada"
     if privado:
         cerrado, det_anonimo = bucket_sin_acceso_anonimo(cfg["bucket_imagenes"], cfg.get("region", "us-east-1"))
         if not cerrado:
-            privado, detalle = False, det_anonimo
+            privado, abierto, detalle = False, True, det_anonimo
     res.agregar(s, "El bucket de imágenes no es público", 3, 1 if privado else 0, detalle)
+    if abierto:
+        res.descontar("bucket", f"bucket de imágenes abierto: {detalle}")
 
 
 def sec_nuevo(cfg, res, ctx):
@@ -325,15 +336,18 @@ def sec_balanceador(cfg, res, ctx):
 
         estado_b, detalle = bucket_estado(cfg["bucket_error"])
         privado = estado_b == "privado"
+        abierto = estado_b == "publico"
         if privado:
             cerrado, det_anonimo = bucket_sin_acceso_anonimo(cfg["bucket_error"], cfg.get("region", "us-east-1"),
                                                              CLAVES_ERROR)
             if not cerrado:
-                privado, detalle = False, det_anonimo
+                privado, abierto, detalle = False, True, det_anonimo
         if privado and not propia:
             detalle = "el bucket es privado, pero la página de error que se ve no es una página propia"
         res.agregar(s, "La página de error está en un bucket privado de S3", 2,
                     1 if privado and propia else 0, detalle)
+        if abierto:
+            res.descontar("bucket", f"bucket de la página de error abierto: {detalle}")
 
         clases = (servidores + ["ERROR"]) if len(servidores) == 2 else []
         if clases:
@@ -510,6 +524,8 @@ def sec_seguridad(cfg, res, ctx):
         puerto = rds.get("Endpoint", {}).get("Port")
         res.agregar(s, f"El RDS escucha en el puerto {PUERTO_RDS}", 0, puerto == PUERTO_RDS,
                     f"puerto configurado: {puerto}", informativo=True)
+        if puerto != PUERTO_RDS:
+            res.descontar("rds", f"el RDS escucha en el puerto {puerto}, no en el {PUERTO_RDS}")
         res.agregar(s, "El RDS no tiene acceso público (PubliclyAccessible = false)", 0,
                     not rds.get("PubliclyAccessible", True), f"PubliclyAccessible = {rds.get('PubliclyAccessible')}",
                     informativo=True)
@@ -520,10 +536,13 @@ def sec_seguridad(cfg, res, ctx):
     est22, banner22 = sondear(host_app, 22)
     res.agregar(s, "El servidor de la app no atiende SSH en el puerto 22 desde internet", 0, est22 != "abierto",
                 f"puerto 22: {est22.replace('_', ' ')}" + (f" ({banner22})" if banner22 else ""), informativo=True)
+    if est22 == "abierto":
+        res.descontar("ssh", "SSH abierto en el puerto 22 desde internet")
     if ssh is None:
         print(color("  (SSH en otro puerto omitido: falta ssh_puerto en el config.json)", "90"))
     elif ssh == 22:
         res.agregar(s, "SSH en un puerto distinto al 22", 0, 0, "ssh_puerto es 22", informativo=True)
+        res.descontar("ssh", "SSH en el puerto 22 (ssh_puerto = 22)")
     else:
         est, banner = sondear(host_app, ssh)
         if est == "abierto" and banner.startswith("SSH-"):
@@ -571,6 +590,8 @@ def sec_seguridad(cfg, res, ctx):
              for r in reglas_abiertas(sg) if cubre(r, 22)]
     res.agregar(s, "Ningún security group deja el puerto 22 abierto a todo internet", 0, not en_22,
                 "; ".join(sorted(set(en_22))) or "", informativo=True)
+    if en_22:
+        res.descontar("ssh", "un security group deja el puerto 22 abierto a todo internet")
 
 
 def validar(cfg):
@@ -713,6 +734,11 @@ def main():
     print(color(f"Puntaje automático: {total:g} / {maximo_eval:g}", "1"))
     if maximo_eval != maximo_total:
         print(f"({maximo_total - maximo_eval:g} puntos no evaluados en esta corrida; máximo posible {maximo_total:g})")
+    if res.descuentos:
+        print()
+        print(color(f"Descuentos de seguridad sobre la nota (escala 0-5): -{sum(v for _, v in res.descuentos.values()):g}", "1"))
+        for motivo, valor in res.descuentos.values():
+            print(f"  {color('✘', '31')} -{valor:g}  {motivo}")
     print("El monitoreo (10 puntos) lo califica el profesor con el correo de alerta que usted le reenvía.")
     print("El informe de arquitectura y la estimación de costos (15 puntos) también los califica el profesor.")
 
@@ -720,6 +746,8 @@ def main():
     with open(args.salida, "w", encoding="utf-8") as f:
         json.dump({"fecha": datetime.now().isoformat(timespec="seconds"), "config": seguro,
                    "puntaje": total, "maximo_evaluado": maximo_eval, "maximo_total": maximo_total,
+                   "descuentos": [{"motivo": m, "valor": v} for m, v in res.descuentos.values()],
+                   "descuento_total": round(sum(v for _, v in res.descuentos.values()), 2),
                    "verificaciones": res.filas}, f, ensure_ascii=False, indent=2)
     print(f"Detalle guardado en {args.salida}")
 
