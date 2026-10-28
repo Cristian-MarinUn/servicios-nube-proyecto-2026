@@ -166,8 +166,9 @@ Opciones útiles:
 
 | Opción | Efecto |
 |---|---|
-| `--seccion balanceador` | Ejecuta solo una sección (`app`, `empleados`, `galeria`, `nuevo`, `balanceador`, `seguridad`, `monitoreo`). Se puede repetir. |
+| `--seccion balanceador` | Ejecuta solo una sección (`app`, `empleados`, `galeria`, `nuevo`, `balanceador`, `seguridad`, `monitoreo`, `carga`). Se puede repetir. |
 | `--aws` | Autoevalúa el monitoreo (alarma de CPU y suscripción de correo) y la seguridad (security groups y puerto del RDS). Usa el CLI de AWS con las credenciales que tenga configuradas. **No suma puntos.** |
+| `--carga-segundos N` | Duración de la prueba de carga de la sección `carga` (1 a 600; por defecto 150). |
 | `--config otro.json` | Usa otro archivo de configuración. |
 
 ### 3. Leer el resultado
@@ -185,6 +186,7 @@ Tenga en cuenta:
 - Los **problemas de seguridad descuentan 0,2 de la nota** (escala 0 a 5), una vez por problema: puerto 22 abierto a todo internet (`0.0.0.0/0` en el security group; se comprueba con `--aws`), RDS que no escucha en el puerto 9876 (se comprueba con `--aws`) y bucket abierto (cualquiera de los dos buckets; se descuenta una sola vez). El informe muestra los descuentos y `resultado.json` los guarda.
 - **SSH en el puerto 22 restringido a su IP es una buena práctica y no descuenta.** Con `--aws` el script lee el origen de la regla del puerto 22 y, si no es `0.0.0.0/0`, lo da por bueno. Sin `--aws` no puede ver el origen: si el puerto 22 responde, el script no descuenta y lo deja en «Para revisar a mano» para que el profesor pida la captura del security group. Si usted corre el script desde la IP que tiene permitida, el 22 le responderá a usted; es normal.
 - La sección *seguridad* **no suma puntos**; el resto de sus revisiones son una autoevaluación. Sin `--aws` revisa desde internet que la base de datos no sea accesible (`rds_endpoint`) y que el servidor no atienda SSH en el puerto 22; con `--aws` revisa además que el RDS esté en el puerto 9876 y sin acceso público, que SSH atienda en `ssh_puerto` y que los security groups no abran a todo internet más de lo necesario (puerto 22, base de datos, servidores detrás del balanceador).
+- La sección *carga* **no corre por defecto**: ejecútela con `--seccion carga`. Inicia la prueba de carga de su intranet (`POST /api/carga`), comprueba que `stress` está instalado, que la prueba arranca y que el CPU del servidor sube al menos al 60 %. **Descuenta 0,3 de la nota** si no funciona. Con `--aws` espera además a que la alarma de CPU del servidor pase a ALARM (puede tardar varios minutos; si su alarma usa un periodo largo, pruebe `--carga-segundos 600`); eso no descuenta, es evidencia para el profesor. El correo de alerta se sigue enviando al profesor, el script no lo ve.
 - Las secciones *galería* y *balanceador* intentan escribir un archivo de prueba en cada bucket sin credenciales. Si el bucket está bien cerrado, se rechaza y no queda nada. Use en `region` la región real de los buckets.
 - La página de error del balanceador debe ser una página propia: una respuesta por defecto (un 503 del balanceador o la página de bienvenida de nginx) no cuenta.
 - Un ✘ en el balanceador puede ser mala suerte estadística: ejecute `--seccion balanceador` otra vez antes de concluir que algo está mal.

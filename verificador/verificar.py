@@ -11,6 +11,7 @@ Uso:
     python3 verificar.py --config otro.json
     python3 verificar.py --validar             # solo revisa que config.json esté completo y que las direcciones respondan
     python3 verificar.py --seccion balanceador # una sola sección
+    python3 verificar.py --seccion carga       # prueba de carga: enciende el CPU del servidor (con --aws espera la alarma)
     python3 verificar.py --aws                 # autoevaluación del monitoreo y de la seguridad (necesita el CLI de AWS con sus credenciales; no suma puntos)
 
 Notas:
@@ -33,9 +34,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 
-SECCIONES = ["app", "empleados", "galeria", "nuevo", "balanceador", "seguridad", "monitoreo"]
+SECCIONES = ["app", "empleados", "galeria", "nuevo", "balanceador", "seguridad", "monitoreo", "carga"]
+# «carga» no corre por defecto: enciende el CPU del servidor durante minutos (use --seccion carga)
+SECCIONES_POR_DEFECTO = [x for x in SECCIONES if x != "carga"]
 
 # Correos de los 21 empleados de ejemplo (database/ddl-empleado.sql)
 CORREOS_BASE = [
@@ -65,6 +68,10 @@ USE_COLOR = sys.stdout.isatty()
 
 # Descuento sobre la nota (escala 0-5) por cada problema de seguridad: SSH, puerto del RDS y bucket abierto
 DESCUENTO = 0.2
+# Descuento si la prueba de carga de la app no funciona (stress no instalado, no arranca o el CPU no sube)
+DESCUENTO_CARGA = 0.3
+# CPU (%) que debe alcanzar el servidor durante la prueba de carga
+UMBRAL_CARGA = 60
 
 
 def color(texto, codigo):
@@ -106,9 +113,9 @@ class Resultados:
     def por_revisar(self, clave, texto_):
         self.revisar.setdefault(clave, texto_)
 
-    def descontar(self, clave, motivo):
-        """Descuento de seguridad sobre la nota (escala 0-5). Cada clave descuenta una sola vez."""
-        self.descuentos.setdefault(clave, (motivo, DESCUENTO))
+    def descontar(self, clave, motivo, valor=None):
+        """Descuento sobre la nota (escala 0-5). Cada clave descuenta una sola vez."""
+        self.descuentos.setdefault(clave, (motivo, DESCUENTO if valor is None else valor))
 
     def agregar(self, seccion, nombre, maximo, fraccion, detalle="", informativo=False):
         """fraccion en [0,1] o None si no se evaluó. Las filas informativas no suman puntos."""
@@ -617,6 +624,104 @@ def sec_seguridad(cfg, res, ctx):
         res.descontar("ssh", "un security group deja el puerto 22 abierto a todo internet")
 
 
+def sec_carga(cfg, res, ctx):
+    """Dispara la prueba de carga de la app (POST /api/carga) y comprueba que el CPU sube.
+    Con --aws espera además a que la alarma de CPU del servidor pase a ALARM."""
+    s = "Prueba de carga"
+    segundos = ctx["carga_segundos"]
+    app = cfg["app_url"]
+
+    def estado():
+        e, _, cu = http("GET", unir(app, "/api/estado"))
+        if e != 200:
+            return None
+        try:
+            return json.loads(cu)
+        except ValueError:
+            return None
+
+    antes = estado()
+    if antes is None:
+        res.agregar(s, "La app responde en /api/estado", 0, 0, "no se pudo probar la carga", informativo=True)
+        res.por_revisar("carga", "No se pudo probar la prueba de carga: la app no respondió en /api/estado")
+        return
+    cpu_antes = antes.get("cpuPorcentaje", 0)
+    instancia = antes.get("instancia") or ""
+    ctx["instancia"] = instancia
+
+    inicio = datetime.now(timezone.utc)
+    est, _, cu = http("POST", unir(app, f"/api/carga?segundos={segundos}"), {}, b"", timeout=30)
+    try:
+        cuerpo = json.loads(cu)
+    except ValueError:
+        cuerpo = {}
+    if est == 500 and cuerpo.get("code") == "STRESS_NO_INSTALADO":
+        res.agregar(s, "El comando stress está instalado", 0, 0, str(cuerpo.get("message", ""))[:120], informativo=True)
+        res.descontar("carga", "el comando stress no está instalado en el servidor", DESCUENTO_CARGA)
+        return
+    if est not in (202, 409):  # 409: ya había una prueba en curso
+        res.agregar(s, "La prueba de carga arranca", 0, 0, f"HTTP {est}", informativo=True)
+        res.descontar("carga", f"la prueba de carga no arrancó (HTTP {est})", DESCUENTO_CARGA)
+        return
+    res.agregar(s, "La prueba de carga arranca", 0, 1, f"instancia {instancia}, {segundos} s", informativo=True)
+
+    pico = cpu_antes
+    for _ in range(max(1, min(segundos, 90) // 3)):
+        time.sleep(3)
+        e = estado()
+        if e:
+            pico = max(pico, e.get("cpuPorcentaje", 0))
+        if pico >= UMBRAL_CARGA:
+            break
+    sube = pico >= UMBRAL_CARGA and pico > cpu_antes
+    res.agregar(s, f"El CPU del servidor sube durante la prueba (al menos {UMBRAL_CARGA} %)", 0, sube,
+                f"antes {cpu_antes} %, pico {pico} %", informativo=True)
+    if not sube:
+        res.descontar("carga", f"el CPU no subió durante la prueba (pico {pico} %)", DESCUENTO_CARGA)
+
+    if not ctx["usar_aws"]:
+        return
+    if shutil.which("aws") is None:
+        res.agregar(s, "CLI de AWS disponible", 0, 0, "no se encontró el comando aws", informativo=True)
+        return
+    region = cfg.get("region", "us-east-1")
+    print(color("  … esperando la alarma de CPU (puede tardar varios minutos)", "90"), flush=True)
+    detalle, disparada, hay_alarma = "", False, True
+    for _ in range(max(1, (segundos + 360) // 20)):
+        try:
+            alarmas = aws(["cloudwatch", "describe-alarms", "--alarm-types", "MetricAlarm"], region).get("MetricAlarms", [])
+        except Exception as e:  # noqa: BLE001
+            res.agregar(s, "Consulta a CloudWatch", 0, 0, f"no se pudo consultar: {e}", informativo=True)
+            return
+        cpu = [a for a in alarmas if a.get("MetricName") == "CPUUtilization"
+               and any(d.get("Name") == "InstanceId" and d.get("Value") == instancia for d in a.get("Dimensions", []))]
+        if not cpu:
+            hay_alarma = False
+            break
+        for a in cpu:
+            if a.get("StateValue") != "ALARM":
+                continue
+            try:
+                desde = datetime.fromisoformat(str(a.get("StateUpdatedTimestamp")).replace("Z", "+00:00"))
+                reciente = desde >= inicio
+            except ValueError:
+                reciente = True
+            if reciente:
+                disparada, detalle = True, f"{a.get('AlarmName')} pasó a ALARM"
+            else:
+                detalle = f"{a.get('AlarmName')} ya estaba en ALARM antes de la prueba"
+        if disparada:
+            break
+        time.sleep(20)
+    if not hay_alarma:
+        res.agregar(s, "La alarma de CPU se dispara con la prueba de carga", 0, 0,
+                    f"no hay alarma de CPU sobre la instancia {instancia or 'desconocida'}", informativo=True)
+    else:
+        res.agregar(s, "La alarma de CPU se dispara con la prueba de carga", 0, disparada,
+                    detalle or f"no pasó a ALARM con {segundos} s de carga; con un periodo largo pruebe --carga-segundos 600",
+                    informativo=True)
+
+
 def validar(cfg):
     """Revisa que cada dirección del config.json responda. No califica nada."""
     pruebas = [
@@ -687,7 +792,7 @@ def sec_monitoreo(cfg, res, ctx):
 
 FUNCIONES = {"app": sec_app, "empleados": sec_empleados, "galeria": sec_galeria,
              "nuevo": sec_nuevo, "balanceador": sec_balanceador, "seguridad": sec_seguridad,
-             "monitoreo": sec_monitoreo}
+             "monitoreo": sec_monitoreo, "carga": sec_carga}
 
 # ----------------------------------------------------------------------------
 # Programa principal
@@ -704,6 +809,8 @@ def main():
                     help="ejecutar solo estas secciones (se puede repetir)")
     ap.add_argument("--validar", action="store_true", help="solo revisar config.json y las direcciones")
     ap.add_argument("--aws", action="store_true", help="autoevaluar el monitoreo y la seguridad (security groups, RDS) con el CLI de AWS (no suma puntos)")
+    ap.add_argument("--carga-segundos", type=int, default=150, dest="carga_segundos",
+                    help="duración de la prueba de carga de la sección «carga» (1 a 600, por defecto 150)")
     ap.add_argument("--muestras", type=int, default=200, help="peticiones al balanceador (por defecto 200)")
     ap.add_argument("--salida", default="resultado.json")
     args = ap.parse_args()
@@ -720,9 +827,10 @@ def main():
     if args.validar:
         sys.exit(0 if validar(cfg) else 1)
 
-    ctx = {"muestras": args.muestras, "usar_aws": args.aws}
+    ctx = {"muestras": args.muestras, "usar_aws": args.aws,
+           "carga_segundos": max(1, min(600, args.carga_segundos))}
     res = Resultados()
-    for nombre in (args.seccion or SECCIONES):
+    for nombre in (args.seccion or SECCIONES_POR_DEFECTO):
         print(color(f"… {nombre}", "90"), flush=True)
         try:
             FUNCIONES[nombre](cfg, res, ctx)
