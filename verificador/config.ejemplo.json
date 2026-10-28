@@ -7,5 +7,7 @@
   "api_key": "su-api-key",
   "bucket_imagenes": "nombre-del-bucket-de-imagenes",
   "bucket_error": "nombre-del-bucket-de-la-pagina-de-error",
-  "region": "us-east-1"
+  "region": "us-east-1",
+  "rds_endpoint": "su-base.xxxxxxxxxxxx.us-east-1.rds.amazonaws.com",
+  "ssh_puerto": 2222
 }

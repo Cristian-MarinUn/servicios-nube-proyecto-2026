@@ -149,6 +149,8 @@ a `verificador/config.json` y complételo con las direcciones de su infraestruct
 | `bucket_imagenes` | Nombre del bucket con las imágenes |
 | `bucket_error` | Nombre del bucket con la página de error |
 | `region` | Región de AWS, por ejemplo `us-east-1` |
+| `rds_endpoint` | Dirección (endpoint) de la base de datos en RDS, sin el puerto. Opcional |
+| `ssh_puerto` | Puerto por el que se conecta por SSH a los servidores (distinto al 22). Opcional |
 
 El archivo contiene la API key: no lo suba a un repositorio público.
 
@@ -164,8 +166,8 @@ Opciones útiles:
 
 | Opción | Efecto |
 |---|---|
-| `--seccion balanceador` | Ejecuta solo una sección (`app`, `empleados`, `galeria`, `nuevo`, `balanceador`, `monitoreo`). Se puede repetir. |
-| `--aws` | Autoevalúa el monitoreo (alarma de CPU y suscripción de correo). Usa el CLI de AWS con las credenciales que tenga configuradas. **No suma puntos.** |
+| `--seccion balanceador` | Ejecuta solo una sección (`app`, `empleados`, `galeria`, `nuevo`, `balanceador`, `seguridad`, `monitoreo`). Se puede repetir. |
+| `--aws` | Autoevalúa el monitoreo (alarma de CPU y suscripción de correo) y la seguridad (security groups y puerto del RDS). Usa el CLI de AWS con las credenciales que tenga configuradas. **No suma puntos.** |
 | `--config otro.json` | Usa otro archivo de configuración. |
 
 ### 3. Leer el resultado
@@ -180,6 +182,9 @@ Tenga en cuenta:
 - El script solo prueba desde internet. El **monitoreo** no suma puntos en el script: lo califica el profesor con el correo de alerta que usted le reenvía como adjunto cuando le llegue. `--aws` sirve para revisar antes que su alarma y su suscripción estén bien.
 - La infraestructura debe estar encendida mientras se ejecuta.
 - Para distinguir un servidor de otro, el script busca en la página el **ID de la instancia EC2** (con la forma `i-0123456789abcdef0`). Cada página de servidor debe mostrarlo.
+- La sección *seguridad* **no suma puntos**: es una autoevaluación. Sin `--aws` revisa desde internet que la base de datos no sea accesible (`rds_endpoint`) y que el servidor no atienda SSH en el puerto 22; con `--aws` revisa además que el RDS esté en el puerto 9876 y sin acceso público, que SSH atienda en `ssh_puerto` y que los security groups no abran a todo internet más de lo necesario (puerto 22, base de datos, servidores detrás del balanceador).
+- Las secciones *galería* y *balanceador* intentan escribir un archivo de prueba en cada bucket sin credenciales. Si el bucket está bien cerrado, se rechaza y no queda nada. Use en `region` la región real de los buckets.
+- La página de error del balanceador debe ser una página propia: una respuesta por defecto (un 503 del balanceador o la página de bienvenida de nginx) no cuenta.
 - Un ✘ en el balanceador puede ser mala suerte estadística: ejecute `--seccion balanceador` otra vez antes de concluir que algo está mal.
 
 ## Reporte de errores
