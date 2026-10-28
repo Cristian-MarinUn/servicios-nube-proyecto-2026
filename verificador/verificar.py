@@ -82,17 +82,32 @@ def color(texto, codigo):
 # Utilidades
 # ----------------------------------------------------------------------------
 
+# Servidores que se dejan de consultar si no responden varias veces seguidas (la app): host -> fallos seguidos.
+# Sin esto, una app apagada o con el puerto cerrado hace esperar el tiempo de espera completo en cada petición.
+CORTE_HOSTS = {}
+MAX_FALLOS = 2
+
+
 def http(metodo, url, headers=None, cuerpo=None, timeout=15):
     """Devuelve (estado, encabezados, cuerpo_bytes). estado=None si no hubo respuesta."""
+    host = urllib.parse.urlparse(url).hostname
+    if CORTE_HOSTS.get(host, 0) >= MAX_FALLOS:
+        return None, {}, b"el servidor no respondi\xc3\xb3 en los intentos anteriores; se omite"
     cab = {"User-Agent": "verificador-nexacloud/1.0"}
     cab.update(headers or {})
     req = urllib.request.Request(url, data=cuerpo, method=metodo, headers=cab)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
+            if host in CORTE_HOSTS:
+                CORTE_HOSTS[host] = 0
             return r.status, dict(r.headers), r.read()
     except urllib.error.HTTPError as e:
+        if host in CORTE_HOSTS:
+            CORTE_HOSTS[host] = 0
         return e.code, dict(e.headers), e.read()
     except Exception as e:  # noqa: BLE001
+        if host in CORTE_HOSTS:
+            CORTE_HOSTS[host] += 1
         return None, {}, str(e).encode()
 
 
@@ -199,6 +214,11 @@ def sec_app(cfg, res, ctx):
     estado, _, cuerpo = http("GET", unir(cfg["app_url"], "/empresa"))
     res.agregar(s, "La app responde en /empresa", 5, 1 if estado == 200 else 0,
                 f"HTTP {estado}" if estado else "no hay respuesta: " + cuerpo.decode(errors="replace")[:80])
+    if estado is None:
+        res.por_revisar("app", "La app no responde desde este computador (app_url). Si la infraestructura está encendida, "
+                        "puede ser que el puerto 3000 no esté abierto a internet en el security group, o que la app esté "
+                        "caída; las demás pruebas que dependen de la app se omiten. Pida la captura del security group "
+                        "o corra el script desde la instancia.")
     esta = estado == 200 and cfg["nombre_empresa"].lower() in texto(cuerpo).lower()
     res.agregar(s, "Muestra el nombre de la empresa", 5, 1 if esta else 0,
                 "" if esta else f"no se encontró «{cfg['nombre_empresa']}» en la página")
@@ -305,6 +325,8 @@ def sec_nuevo(cfg, res, ctx):
         e, _, cu2 = http("GET", unir(cfg["app_url"], "/empleados"))
         if e == 200 and correo_app in texto(cu2).lower():
             aparece = True
+            break
+        if e is None:  # la app no respondió: no tiene sentido esperar
             break
         time.sleep(2)
     res.agregar(s, "El empleado registrado aparece en el directorio", 5, 1 if aparece else 0,
@@ -845,6 +867,8 @@ def main():
 
     if args.validar:
         sys.exit(0 if validar(cfg) else 1)
+
+    CORTE_HOSTS[urllib.parse.urlparse(cfg["app_url"]).hostname] = 0
 
     ctx = {"muestras": args.muestras, "usar_aws": args.aws,
            "carga_segundos": max(1, min(600, args.carga_segundos))}
