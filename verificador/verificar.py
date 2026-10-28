@@ -159,31 +159,35 @@ def bucket_sin_acceso_anonimo(bucket, region, claves=()):
 
 
 def error_generico(cabeceras, cuerpo):
-    """True si la respuesta sin ID de instancia parece una página de error por defecto y no una hecha por el grupo."""
+    """Por qué la respuesta sin ID de instancia parece una página de error por defecto y no una hecha
+    por el grupo. Devuelve el motivo, o '' si parece una página propia."""
     servidor = next((v for k, v in cabeceras.items() if k.lower() == "server"), "")
     if "awselb" in servidor.lower():  # respuesta fabricada por el propio balanceador
-        return True
-    if len(cuerpo) < 300:
-        return True
-    return len(cuerpo) < 2000 and bool(ERROR_POR_DEFECTO.search(texto(cuerpo)))
+        return "la respuesta la fabrica el balanceador (cabecera Server: awselb)"
+    if len(cuerpo) < 50:
+        return f"la respuesta está vacía o casi ({len(cuerpo)} bytes)"
+    if len(cuerpo) < 2000 and ERROR_POR_DEFECTO.search(texto(cuerpo)):
+        return "el texto es el de una página de error por defecto del balanceador o de un servidor"
+    return ""
 
 
 def pedir_balanceador(url, i):
-    """(clase, generica). clase: ID de instancia, 'ERROR' (sin ID) o None (sin respuesta)."""
+    """(clase, motivo_generico, estado). clase: ID de instancia, 'ERROR' (sin ID) o None (sin respuesta).
+    motivo_generico: por qué una respuesta de error parece por defecto ('' si parece propia)."""
     e, cab, cu = http("GET", f"{url.rstrip('/')}/?n={i}-{uuid.uuid4().hex[:6]}", timeout=10)
     if e is None:
-        return None, False
+        return None, "", None
     ids = ID_INSTANCIA.findall(texto(cu))
     if ids:
-        return ids[0], False
-    return "ERROR", error_generico(cab, cu)
+        return ids[0], "", e
+    return "ERROR", error_generico(cab, cu), e
 
 
 def servidores_del_balanceador(cfg, ctx, n=30):
     """IDs de instancia que entrega el balanceador (los de la sección «balanceador» si ya corrió)."""
     if "servidores" not in ctx:
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
-            clases = [c for c, _ in pool.map(lambda i: pedir_balanceador(cfg["balanceador_url"], i), range(n))]
+            clases = [c for c, *_ in pool.map(lambda i: pedir_balanceador(cfg["balanceador_url"], i), range(n))]
         ctx["servidores"] = sorted({c for c in clases if c not in (None, "ERROR")})
     return ctx["servidores"]
 
@@ -316,8 +320,9 @@ def sec_balanceador(cfg, res, ctx):
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as pool:
         respuestas = list(pool.map(lambda i: pedir_balanceador(url, i), range(n)))
-    validas = [c for c, _ in respuestas if c is not None]
-    genericas = sum(1 for c, g in respuestas if c == "ERROR" and g)
+    validas = [c for c, *_ in respuestas if c is not None]
+    genericas = sum(1 for c, motivo, _ in respuestas if c == "ERROR" and motivo)
+    propias = [e for c, motivo, e in respuestas if c == "ERROR" and not motivo]  # códigos HTTP de las páginas propias
 
     if len(validas) < n * 0.9:
         res.agregar(s, "El balanceador responde", 0, 1, f"solo {len(validas)} de {n} peticiones tuvieron respuesta")
@@ -339,11 +344,19 @@ def sec_balanceador(cfg, res, ctx):
         res.agregar(s, "Dos servidores distintos (identificador visible)", 5,
                     1 if len(servidores) == 2 else 0,
                     f"identificadores vistos: {', '.join(servidores) or 'ninguno'}")
+        # una página de error debe responder con un código de error (4xx o 5xx), no con 200
+        con_codigo = sum(1 for e in propias if e is not None and e >= 400)
+        codigo_ok = propia and con_codigo > len(propias) / 2
         detalle_error = f"{errores} de {len(validas)} respuestas sin identificador de servidor"
         if errores and not propia:
-            detalle_error += (f"; {genericas} parecen una página de error por defecto "
-                              "(del balanceador o de un servidor), no una página propia")
-        res.agregar(s, "Aparece la página de error", 2, 1 if propia else 0, detalle_error)
+            motivos = [m for c, m, _ in respuestas if c == "ERROR" and m]
+            comun = max(set(motivos), key=motivos.count) if motivos else ""
+            detalle_error += f"; {genericas} parecen una página de error por defecto ({comun}), no una página propia"
+        elif propia and not codigo_ok:
+            codigos = sorted({e for e in propias if e is not None})
+            detalle_error += (f"; tiene página propia, pero responde HTTP {', '.join(map(str, codigos))}: "
+                              "una página de error debe responder un código 4xx o 5xx (por ejemplo 503), así que no cuenta")
+        res.agregar(s, "Aparece la página de error", 2, 1 if codigo_ok else 0, detalle_error)
 
         estado_b, detalle = bucket_estado(cfg["bucket_error"])
         privado = estado_b == "privado"
