@@ -541,12 +541,20 @@ def sec_seguridad(cfg, res, ctx):
             privada = ipaddress.ip_address(ip).is_private
         except (OSError, ValueError):
             ip, privada = "", False
-        estado_p, _ = sondear(rds_endpoint, PUERTO_RDS)
-        cerrado = estado_p != "abierto"
-        res.agregar(s, f"El RDS no es accesible desde internet (puerto {PUERTO_RDS})", 0, cerrado,
-                    (f"resuelve a {ip} " + ("(IP privada)" if privada else "(IP pública)") + "; " if ip else "")
-                    + ("el puerto no responde desde fuera" if cerrado else "el puerto responde desde internet"),
-                    informativo=True)
+        if not ip:
+            # sin DNS no se puede probar nada: un nombre mal escrito no debe salir como «cerrado»
+            res.agregar(s, f"El RDS no es accesible desde internet (puerto {PUERTO_RDS})", 0, 0,
+                        "la dirección rds_endpoint no se pudo resolver en DNS; no se pudo comprobar",
+                        informativo=True)
+            res.por_revisar("rds", "No se pudo resolver rds_endpoint en DNS: revise que esté bien escrito o pida una "
+                            "captura del RDS (puerto y «Acceso público: No»)")
+        else:
+            estado_p, _ = sondear(rds_endpoint, PUERTO_RDS)
+            cerrado = estado_p != "abierto"
+            res.agregar(s, f"El RDS no es accesible desde internet (puerto {PUERTO_RDS})", 0, cerrado,
+                        f"resuelve a {ip} " + ("(IP privada)" if privada else "(IP pública)") + "; "
+                        + ("el puerto no responde desde fuera" if cerrado else "el puerto responde desde internet"),
+                        informativo=True)
     else:
         print(color("  (RDS omitido: falta rds_endpoint en el config.json, o use --aws)", "90"))
     if rds:
