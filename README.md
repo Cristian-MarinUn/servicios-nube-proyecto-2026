@@ -5,7 +5,7 @@ Aplicación web interna para los empleados de la empresa. Está desarrollada con
 de la empresa (Amazon Web Services).
 
 ## Secciones de la intranet
-
+##
 | Sección | Ruta | Qué muestra | Servicio que necesita |
 |---|---|---|---|
 | Inicio | `/` | Bienvenida | Ninguno |
